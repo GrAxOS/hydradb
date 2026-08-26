@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Environment
+        run: |
+          set -eux
+          dotnet --info
+
+      - name: Clone source
+        run: |
+          set -eux
+          git clone --no-checkout "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          git checkout --detach "${{ github.sha }}"
+          ls -la
+
+      - name: Restore
+        working-directory: repo
+        run: dotnet restore HydraDB.sln
+
+      - name: Build
+        working-directory: repo
+        run: dotnet build HydraDB.sln -c Release --no-restore
+
+      - name: Test
+        working-directory: repo
+        run: dotnet test HydraDB.sln -c Release --no-build --logger "console;verbosity=minimal"
+
+      - name: CLI smoke (.stats)
+        working-directory: repo
+        run: |
+          set -eux
+          printf 'create table t (id int primary key, v int)\ninsert into t values (1,10), (2,20), (3,30)\n.checkpoint\n.stats\n' | dotnet run -c Release --project src/HydraDB.Cli -- ./ci-data
