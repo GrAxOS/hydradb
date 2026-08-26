@@ -1,4 +1,5 @@
 using HydraDB.Core.Catalog;
+using HydraDB.Core.Index;
 using HydraDB.Core.Sql;
 using HydraDB.Core.Txn;
 
@@ -7,13 +8,19 @@ namespace HydraDB.Core.Exec;
 /// <summary>
 /// Executes a parsed statement against a snapshot. Every read goes through
 /// <see cref="MvccStore.Scan"/>, so constraint checks observe exactly the rows the
-/// statement itself can see.
+/// statement itself can see. When a B+Tree primary index exists for the table, the
+/// uniqueness check is O(log_m n) instead of a linear scan.
 /// </summary>
 public sealed class Executor
 {
     private readonly MvccStore _store;
+    private readonly TableIndexSet? _indexes;
 
-    public Executor(MvccStore store) => _store = store;
+    public Executor(MvccStore store, TableIndexSet? indexes = null)
+    {
+        _store = store;
+        _indexes = indexes;
+    }
 
     public QueryResult Run(Stmt statement, Transaction txn) => statement switch
     {
@@ -67,7 +74,9 @@ public sealed class Executor
 
             CheckPrimaryKey(def, values, txn, 0);
             CheckForeignKeys(def, values, txn);
-            _store.Insert(def.Name, values, txn);
+
+            long rowId = _store.Insert(def.Name, values, txn);
+            IndexRow(def, rowId, values);
             inserted++;
         }
 
@@ -157,7 +166,9 @@ public sealed class Executor
 
             CheckPrimaryKey(def, values, txn, version.RowId);
             CheckForeignKeys(def, values, txn);
+
             _store.Update(def.Name, version, values, txn);
+            IndexRow(def, version.RowId, values);
             updated++;
         }
 
@@ -198,6 +209,21 @@ public sealed class Executor
         };
     }
 
+    /// <summary>Publishes the newest version of a row into the primary index.</summary>
+    private void IndexRow(TableDef def, long rowId, object?[] values)
+    {
+        if (_indexes is null) return;
+        if (!_indexes.TryGetTable(def.Name, out Table _)) return;
+
+        List<RowVersion> versions = _store.GetTable(def.Name).Versions;
+        for (int i = versions.Count - 1; i >= 0; i--)
+        {
+            if (versions[i].RowId != rowId) continue;
+            _indexes.OnRowWritten(def, rowId, versions[i], values);
+            return;
+        }
+    }
+
     private void CheckPrimaryKey(TableDef def, object?[] values, Transaction txn, long excludedRowId)
     {
         for (int i = 0; i < def.Columns.Count; i++)
@@ -207,6 +233,17 @@ public sealed class Executor
             object? candidate = values[i];
             if (candidate is null)
                 throw new SqlException($"primary key '{def.Columns[i].Name}' cannot be null");
+
+            // Indexed path: one descent of the B+Tree plus one visibility test.
+            if (_indexes is not null
+                && candidate is long key
+                && _indexes.TryGetTable(def.Name, out Table indexed)
+                && indexed.PrimaryKeyColumn == i)
+            {
+                if (_indexes.HasVisibleDuplicate(indexed, key, excludedRowId, _store, txn))
+                    throw new SqlException($"duplicate primary key in '{def.Name}'");
+                continue;
+            }
 
             foreach (RowVersion version in _store.Scan(def.Name, txn))
             {
@@ -232,6 +269,18 @@ public sealed class Executor
             int parentIndex = parent.IndexOf(fk.ReferencedColumn);
             if (parentIndex < 0)
                 throw new SqlException($"unknown referenced column '{fk.ReferencedColumn}'");
+
+            // Indexed path when the referenced column is the parent's INT64 primary key.
+            if (_indexes is not null
+                && value is long key
+                && _indexes.TryGetTable(parent.Name, out Table indexedParent)
+                && indexedParent.PrimaryKeyColumn == parentIndex)
+            {
+                if (!indexedParent.PrimaryKeyIndex.Search(key).HasValue
+                    || !_indexes.HasVisibleDuplicate(indexedParent, key, -1, _store, txn))
+                    throw new SqlException($"foreign key violation on '{def.Name}.{fk.Column}'");
+                continue;
+            }
 
             bool found = false;
             foreach (RowVersion version in _store.Scan(parent.Name, txn))

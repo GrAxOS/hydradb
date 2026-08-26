@@ -1,5 +1,6 @@
 using System.Text;
 using HydraDB.Core.Exec;
+using HydraDB.Core.Index;
 using HydraDB.Core.Log;
 using HydraDB.Core.Sql;
 using HydraDB.Core.Storage;
@@ -8,12 +9,13 @@ using HydraDB.Core.Txn;
 namespace HydraDB.Core;
 
 /// <summary>
-/// One database directory: hydra.snap (checkpoint image) plus hydra.wal (redo log).
+/// One database directory: hydra.snap (checkpoint image), hydra.wal (redo log), and one
+/// pk.&lt;table&gt;.idx / .idxlog pair per table with an INT64 primary key.
 ///
-/// Recovery order at open: load the snapshot image, then replay every intact WAL
-/// record on top of it. Commit order: append one record, fsync, then publish the
-/// commit sequence number. Checkpoint order: write and fsync the new image, then
-/// reset the WAL, then vacuum.
+/// Recovery order at open: load the snapshot image, replay every intact WAL record on top
+/// of it, then rebuild the derived primary indexes. Commit order: append one record,
+/// fsync, then publish the commit sequence number. Checkpoint order: write and fsync the
+/// new image, reset the WAL, checkpoint the indexes, then vacuum.
 /// </summary>
 public sealed class Engine : IDisposable
 {
@@ -24,6 +26,7 @@ public sealed class Engine : IDisposable
     private readonly Pager _pager;
     private readonly Wal _wal;
     private readonly MvccStore _store = new();
+    private readonly TableIndexSet _indexes;
     private readonly Executor _executor;
     private Transaction? _session;
     private long _commits;
@@ -33,13 +36,19 @@ public sealed class Engine : IDisposable
         Directory.CreateDirectory(directory);
         _pager = new Pager(Path.Combine(directory, SnapshotFileName));
         _wal = new Wal(Path.Combine(directory, WalFileName));
-        _executor = new Executor(_store);
+        _indexes = new TableIndexSet(directory);
+        _executor = new Executor(_store, _indexes);
 
         LoadSnapshot();
         Replay();
+
+        _indexes.RegisterAll(_store);
+        _indexes.RebuildAll(_store);
     }
 
     public MvccStore Store => _store;
+
+    public TableIndexSet Indexes => _indexes;
 
     public long Commits => _commits;
 
@@ -54,13 +63,19 @@ public sealed class Engine : IDisposable
         if (statement is TransactionStmt control) return RunControl(control);
 
         Transaction? target = txn ?? _session;
-        if (target is not null) return _executor.Run(statement, target);
+        if (target is not null)
+        {
+            QueryResult scoped = _executor.Run(statement, target);
+            RegisterNewTable(statement);
+            return scoped;
+        }
 
         Transaction auto = _store.BeginTxn();
         try
         {
             QueryResult result = _executor.Run(statement, auto);
             Commit(auto);
+            RegisterNewTable(statement);
             return result;
         }
         catch
@@ -68,6 +83,11 @@ public sealed class Engine : IDisposable
             _store.Abort(auto);
             throw;
         }
+    }
+
+    private void RegisterNewTable(Stmt statement)
+    {
+        if (statement is CreateTableStmt created) _indexes.Register(created.Def);
     }
 
     private QueryResult RunControl(TransactionStmt control)
@@ -118,6 +138,7 @@ public sealed class Engine : IDisposable
     {
         WriteSnapshot();
         _wal.Reset();
+        _indexes.Checkpoint();
         _store.Vacuum();
     }
 
@@ -195,6 +216,7 @@ public sealed class Engine : IDisposable
 
     public void Dispose()
     {
+        _indexes.Dispose();
         _wal.Dispose();
         _pager.Dispose();
     }
