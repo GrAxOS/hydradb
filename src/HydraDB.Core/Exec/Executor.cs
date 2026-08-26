@@ -5,6 +5,15 @@ using HydraDB.Core.Txn;
 
 namespace HydraDB.Core.Exec;
 
+/// <summary>Access path chosen for the most recent scan.</summary>
+public enum ScanPlan
+{
+    None,
+    HeapScalar,
+    HeapVector,
+    IndexRange
+}
+
 /// <summary>
 /// Executes a parsed statement against a snapshot. Every read goes through
 /// <see cref="MvccStore.Scan"/>, so constraint checks observe exactly the rows the
@@ -21,6 +30,9 @@ public sealed class Executor
         _store = store;
         _indexes = indexes;
     }
+
+    /// <summary>Access path used by the most recent scan. Diagnostic only.</summary>
+    public ScanPlan LastPlan { get; private set; } = ScanPlan.None;
 
     public QueryResult Run(Stmt statement, Transaction txn) => statement switch
     {
@@ -108,6 +120,8 @@ public sealed class Executor
                 names.Add(def.Columns[index].Name);
             }
         }
+
+        LastPlan = ScanPlan.HeapScalar;
 
         var matched = new List<object?[]>();
         foreach (RowVersion version in _store.Scan(def.Name, txn))
@@ -238,6 +252,7 @@ public sealed class Executor
             if (_indexes is not null
                 && candidate is long key
                 && _indexes.TryGetTable(def.Name, out Table indexed)
+                && indexed.HasPrimaryKey
                 && indexed.PrimaryKeyColumn == i)
             {
                 if (_indexes.HasVisibleDuplicate(indexed, key, excludedRowId, _store, txn))
@@ -270,14 +285,15 @@ public sealed class Executor
             if (parentIndex < 0)
                 throw new SqlException($"unknown referenced column '{fk.ReferencedColumn}'");
 
-            // Indexed path when the referenced column is the parent's INT64 primary key.
+            // Indexed path when the referenced column is the parent's INT64 primary key:
+            // one probe, not a Search followed by a duplicate check.
             if (_indexes is not null
                 && value is long key
                 && _indexes.TryGetTable(parent.Name, out Table indexedParent)
+                && indexedParent.HasPrimaryKey
                 && indexedParent.PrimaryKeyColumn == parentIndex)
             {
-                if (!indexedParent.PrimaryKeyIndex.Search(key).HasValue
-                    || !_indexes.HasVisibleDuplicate(indexedParent, key, -1, _store, txn))
+                if (!_indexes.HasVisibleKey(indexedParent, key, _store, txn))
                     throw new SqlException($"foreign key violation on '{def.Name}.{fk.Column}'");
                 continue;
             }
