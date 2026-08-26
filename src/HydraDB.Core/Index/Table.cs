@@ -1,4 +1,5 @@
 using HydraDB.Core.Catalog;
+using HydraDB.Core.Storage;
 using HydraDB.Core.Txn;
 
 namespace HydraDB.Core.Index;
@@ -15,6 +16,18 @@ public sealed class Secondary
     public string Column { get; }
     public BPlusTree Tree { get; }
 }
+
+/// <summary>Shape of one primary index at a point in time. Diagnostics only.</summary>
+public sealed record IndexStats(
+    string Table,
+    int Order,
+    int Height,
+    long KeyCount,
+    int PageCount,
+    double FillFactor,
+    long LogBytes,
+    bool CrcOk,
+    int SecondaryCount);
 
 /// <summary>A table plus its primary-key index and a row-id to newest-version map.</summary>
 public sealed class Table
@@ -156,6 +169,54 @@ public sealed class TableIndexSet : IDisposable
     /// </summary>
     public bool HasVisibleKey(Table table, long key, MvccStore store, Transaction txn) =>
         HasVisibleDuplicate(table, key, 0, store, txn);
+
+    /// <summary>
+    /// Shape of one index. <c>CrcOk</c> is the result of a full structural validation, so this
+    /// is a diagnostic call, not something to run per statement. Fill factor is payload bytes
+    /// (16 per key) over allocated bytes, so a freshly split tree sits near 50 percent.
+    /// </summary>
+    public IndexStats? GetStats(string name)
+    {
+        if (!_tables.TryGetValue(name, out Table? table)) return null;
+
+        BPlusTree tree = table.PrimaryKeyIndex;
+
+        bool crcOk = true;
+        try
+        {
+            tree.Validate();
+        }
+        catch (InvalidDataException)
+        {
+            crcOk = false;
+        }
+
+        double fillFactor = tree.PageCount > 0
+            ? tree.KeyCount * 16.0 / (tree.PageCount * (double)Pager.PageSize) * 100.0
+            : 0.0;
+
+        return new IndexStats(
+            table.Def.Name,
+            tree.Order,
+            tree.Height,
+            tree.KeyCount,
+            tree.PageCount,
+            fillFactor,
+            tree.LogBytes,
+            crcOk,
+            table.Secondary.Count);
+    }
+
+    public Dictionary<string, IndexStats> GetAllStats()
+    {
+        var stats = new Dictionary<string, IndexStats>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Table table in _tables.Values)
+            if (GetStats(table.Def.Name) is IndexStats snapshot)
+                stats[table.Def.Name] = snapshot;
+
+        return stats;
+    }
 
     public void Checkpoint()
     {

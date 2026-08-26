@@ -15,10 +15,17 @@ public enum ScanPlan
 }
 
 /// <summary>
-/// Executes a parsed statement against a snapshot. Every read goes through
-/// <see cref="MvccStore.Scan"/>, so constraint checks observe exactly the rows the
-/// statement itself can see. When a B+Tree primary index exists for the table, the
-/// uniqueness check is O(log_m n) instead of a linear scan.
+/// Executes a parsed statement against a snapshot.
+///
+/// Reads run through a chunked pipeline: rows are batched into a <see cref="DataChunk"/> of
+/// 1024 and filtered a chunk at a time. Three access paths, strongest first:
+///   IndexRange  - the predicate bounds the INT64 primary key, so the B+Tree is walked.
+///   HeapVector  - one INT comparison against a literal, evaluated with SIMD.
+///   HeapScalar  - anything else, evaluated row by row by the interpreter.
+///
+/// Writes go through <see cref="BulkInsert"/>: every row is validated before any row is
+/// written, so one statement is one transaction and one WAL commit, and a violation
+/// anywhere in the batch leaves the heap and the index untouched.
 /// </summary>
 public sealed class Executor
 {
@@ -54,10 +61,12 @@ public sealed class Executor
         return QueryResult.Message($"table '{statement.Def.Name}' created");
     }
 
+    // ---------------------------------------------------------------- writes
+
     private QueryResult Insert(InsertStmt statement, Transaction txn)
     {
         TableDef def = _store.GetTable(statement.Table).Def;
-        int inserted = 0;
+        var batch = new List<object?[]>(statement.Rows.Count);
 
         foreach (List<Expr> rowExprs in statement.Rows)
         {
@@ -84,77 +93,51 @@ public sealed class Executor
                 }
             }
 
-            CheckPrimaryKey(def, values, txn, 0);
-            CheckForeignKeys(def, values, txn);
-
-            long rowId = _store.Insert(def.Name, values, txn);
-            IndexRow(def, rowId, values);
-            inserted++;
+            batch.Add(values);
         }
 
-        return QueryResult.Changed(inserted);
+        return BulkInsert(def, batch, txn);
     }
 
-    private QueryResult Select(SelectStmt statement, Transaction txn)
+    /// <summary>
+    /// Atomic batch insert. Phase 1 validates every row, including duplicates that exist only
+    /// inside the batch itself. Phase 2 writes. Nothing is written until everything validates,
+    /// so the caller's transaction produces exactly one WAL commit.
+    /// </summary>
+    public QueryResult BulkInsert(TableDef def, List<object?[]> rows, Transaction txn)
     {
-        TableDef def = _store.GetTable(statement.Table).Def;
-
-        var indices = new List<int>();
-        var names = new List<string>();
-
-        if (statement.Columns.Count == 1 && statement.Columns[0] == "*")
+        int primaryKeyColumn = -1;
+        for (int i = 0; i < def.Columns.Count; i++)
         {
-            for (int i = 0; i < def.Columns.Count; i++)
+            if (!def.Columns[i].PrimaryKey) continue;
+            primaryKeyColumn = i;
+            break;
+        }
+
+        var seen = primaryKeyColumn >= 0 ? new HashSet<object>(rows.Count) : null;
+
+        foreach (object?[] values in rows)
+        {
+            if (seen is not null)
             {
-                indices.Add(i);
-                names.Add(def.Columns[i].Name);
+                object? candidate = values[primaryKeyColumn];
+                if (candidate is null)
+                    throw new SqlException($"primary key '{def.Columns[primaryKeyColumn].Name}' cannot be null");
+                if (!seen.Add(candidate))
+                    throw new SqlException($"duplicate primary key in '{def.Name}'");
             }
+
+            CheckPrimaryKey(def, values, txn, 0);
+            CheckForeignKeys(def, values, txn);
         }
-        else
+
+        foreach (object?[] values in rows)
         {
-            foreach (string column in statement.Columns)
-            {
-                int index = def.IndexOf(column);
-                if (index < 0) throw new SqlException($"unknown column '{column}'");
-                indices.Add(index);
-                names.Add(def.Columns[index].Name);
-            }
+            long rowId = _store.Insert(def.Name, values, txn);
+            IndexRow(def, rowId, values);
         }
 
-        LastPlan = ScanPlan.HeapScalar;
-
-        var matched = new List<object?[]>();
-        foreach (RowVersion version in _store.Scan(def.Name, txn))
-            if (statement.Where is null || Evaluator.Truthy(Evaluator.Eval(statement.Where, def, version.Values)))
-                matched.Add(version.Values);
-
-        if (statement.OrderBy is not null)
-        {
-            int orderIndex = def.IndexOf(statement.OrderBy);
-            if (orderIndex < 0) throw new SqlException($"unknown column '{statement.OrderBy}'");
-
-            matched.Sort((left, right) =>
-            {
-                object? a = left[orderIndex];
-                object? b = right[orderIndex];
-                int comparison = a is null
-                    ? (b is null ? 0 : -1)
-                    : (b is null ? 1 : Evaluator.Compare(a, b));
-                return statement.OrderDescending ? -comparison : comparison;
-            });
-        }
-
-        var rows = new List<object?[]>();
-        foreach (object?[] row in matched)
-        {
-            if (statement.Limit is int limit && rows.Count >= limit) break;
-
-            var projected = new object?[indices.Count];
-            for (int i = 0; i < indices.Count; i++) projected[i] = row[indices[i]];
-            rows.Add(projected);
-        }
-
-        return new QueryResult { Columns = names, Rows = rows };
+        return QueryResult.Changed(rows.Count);
     }
 
     private QueryResult Update(UpdateStmt statement, Transaction txn)
@@ -203,6 +186,365 @@ public sealed class Executor
 
         return QueryResult.Changed(targets.Count);
     }
+
+    // ---------------------------------------------------------------- reads
+
+    private QueryResult Select(SelectStmt statement, Transaction txn)
+    {
+        TableDef def = _store.GetTable(statement.Table).Def;
+
+        if (statement.Aggregates.Count > 0) return Aggregate(statement, def, txn);
+
+        var indices = new List<int>();
+        var names = new List<string>();
+
+        if (statement.Columns.Count == 1 && statement.Columns[0] == "*")
+        {
+            for (int i = 0; i < def.Columns.Count; i++)
+            {
+                indices.Add(i);
+                names.Add(def.Columns[i].Name);
+            }
+        }
+        else
+        {
+            foreach (string column in statement.Columns)
+            {
+                int index = def.IndexOf(column);
+                if (index < 0) throw new SqlException($"unknown column '{column}'");
+                indices.Add(index);
+                names.Add(def.Columns[index].Name);
+            }
+        }
+
+        var matched = new List<object?[]>();
+        foreach (DataChunk chunk in Pipeline(def, statement.Where, txn))
+            for (int i = 0; i < chunk.Selection.Count; i++)
+                matched.Add(chunk.Rows[chunk.Selection.Indices[i]]);
+
+        if (statement.OrderBy is not null)
+        {
+            int orderIndex = def.IndexOf(statement.OrderBy);
+            if (orderIndex < 0) throw new SqlException($"unknown column '{statement.OrderBy}'");
+
+            matched.Sort((left, right) =>
+            {
+                object? a = left[orderIndex];
+                object? b = right[orderIndex];
+                int comparison = a is null
+                    ? (b is null ? 0 : -1)
+                    : (b is null ? 1 : Evaluator.Compare(a, b));
+                return statement.OrderDescending ? -comparison : comparison;
+            });
+        }
+
+        var rows = new List<object?[]>();
+        foreach (object?[] row in matched)
+        {
+            if (statement.Limit is int limit && rows.Count >= limit) break;
+
+            var projected = new object?[indices.Count];
+            for (int i = 0; i < indices.Count; i++) projected[i] = row[indices[i]];
+            rows.Add(projected);
+        }
+
+        return new QueryResult { Columns = names, Rows = rows };
+    }
+
+    private QueryResult Aggregate(SelectStmt statement, TableDef def, Transaction txn)
+    {
+        int groupColumn = -1;
+        string? groupName = null;
+
+        if (statement.GroupBy is not null)
+        {
+            groupColumn = def.IndexOf(statement.GroupBy);
+            if (groupColumn < 0) throw new SqlException($"unknown column '{statement.GroupBy}'");
+            groupName = def.Columns[groupColumn].Name;
+        }
+
+        foreach (AggregateSpec spec in statement.Aggregates)
+        {
+            if (spec.Kind == AggregateKind.CountStar) continue;
+
+            int index = def.IndexOf(spec.Column!);
+            if (index < 0) throw new SqlException($"unknown column '{spec.Column}'");
+            spec.ColumnIndex = index;
+        }
+
+        var aggregate = new HashAggregate(groupColumn, groupName, statement.Aggregates);
+        return aggregate.Run(Pipeline(def, statement.Where, txn), estimatedKeys: 64);
+    }
+
+    /// <summary>Chooses the access path and returns the matching chunk stream.</summary>
+    private IEnumerable<DataChunk> Pipeline(TableDef def, Expr? where, Transaction txn)
+    {
+        if (TryPlanIndexRange(def, where, out Table? indexed, out long low, out long high))
+        {
+            LastPlan = ScanPlan.IndexRange;
+            return IndexRangeChunks(indexed!, low, high, txn);
+        }
+
+        if (TryPlanVectorFilter(def, where, out int column, out CompareOp op, out long threshold))
+        {
+            LastPlan = ScanPlan.HeapVector;
+            return VectorChunks(def, column, op, threshold, txn);
+        }
+
+        LastPlan = ScanPlan.HeapScalar;
+        return ScalarChunks(def, where, txn);
+    }
+
+    private bool TryPlanIndexRange(TableDef def, Expr? where, out Table? indexed, out long low, out long high)
+    {
+        indexed = null;
+        low = long.MinValue;
+        high = long.MaxValue;
+
+        if (where is null || _indexes is null) return false;
+        if (!_indexes.TryGetTable(def.Name, out Table table) || !table.HasPrimaryKey) return false;
+
+        bool bounded = false;
+        if (!CollectBounds(where, def, table.PrimaryKeyColumn, ref low, ref high, ref bounded)) return false;
+        if (!bounded || low > high) return false;
+
+        indexed = table;
+        return true;
+    }
+
+    /// <summary>
+    /// Folds a conjunction of primary-key comparisons into one closed range. Returns false as
+    /// soon as anything else appears, because a leftover predicate would need re-checking.
+    /// </summary>
+    private static bool CollectBounds(Expr expr, TableDef def, int keyColumn, ref long low, ref long high, ref bool bounded)
+    {
+        if (expr is not Binary binary) return false;
+
+        if (binary.Op == "and")
+        {
+            return CollectBounds(binary.Left, def, keyColumn, ref low, ref high, ref bounded)
+                && CollectBounds(binary.Right, def, keyColumn, ref low, ref high, ref bounded);
+        }
+
+        if (!TryReadKeyComparison(binary, def, keyColumn, out string op, out long value)) return false;
+
+        switch (op)
+        {
+            case "=":
+                if (value > low) low = value;
+                if (value < high) high = value;
+                break;
+            case ">=":
+                if (value > low) low = value;
+                break;
+            case ">":
+                if (value == long.MaxValue) return false;
+                if (value + 1 > low) low = value + 1;
+                break;
+            case "<=":
+                if (value < high) high = value;
+                break;
+            case "<":
+                if (value == long.MinValue) return false;
+                if (value - 1 < high) high = value - 1;
+                break;
+            default:
+                return false;
+        }
+
+        bounded = true;
+        return true;
+    }
+
+    /// <summary>Normalizes "key op literal" and "literal op key" into "key op literal".</summary>
+    private static bool TryReadKeyComparison(Binary binary, TableDef def, int keyColumn, out string op, out long value)
+    {
+        op = binary.Op;
+        value = 0;
+
+        if (binary.Left is ColumnRef left && binary.Right is Literal literal)
+        {
+            if (def.IndexOf(left.Name) != keyColumn) return false;
+            if (literal.Value is not long number) return false;
+            value = number;
+            return true;
+        }
+
+        if (binary.Left is Literal mirrored && binary.Right is ColumnRef right)
+        {
+            if (def.IndexOf(right.Name) != keyColumn) return false;
+            if (mirrored.Value is not long number) return false;
+
+            value = number;
+            op = binary.Op switch
+            {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                _ => binary.Op
+            };
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryPlanVectorFilter(TableDef def, Expr? where, out int column, out CompareOp op, out long threshold)
+    {
+        column = -1;
+        op = CompareOp.Equal;
+        threshold = 0;
+
+        if (where is not Binary binary) return false;
+
+        string text;
+        if (binary.Left is ColumnRef left && binary.Right is Literal literal)
+        {
+            column = def.IndexOf(left.Name);
+            if (literal.Value is not long number) return false;
+            threshold = number;
+            text = binary.Op;
+        }
+        else if (binary.Left is Literal mirrored && binary.Right is ColumnRef right)
+        {
+            column = def.IndexOf(right.Name);
+            if (mirrored.Value is not long number) return false;
+            threshold = number;
+            text = binary.Op switch
+            {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                _ => binary.Op
+            };
+        }
+        else
+        {
+            return false;
+        }
+
+        if (column < 0 || def.Columns[column].Type != ColumnType.Int) return false;
+
+        switch (text)
+        {
+            case "=": op = CompareOp.Equal; return true;
+            case "<>": op = CompareOp.NotEqual; return true;
+            case "<": op = CompareOp.Less; return true;
+            case "<=": op = CompareOp.LessOrEqual; return true;
+            case ">": op = CompareOp.Greater; return true;
+            case ">=": op = CompareOp.GreaterOrEqual; return true;
+            default: return false;
+        }
+    }
+
+    /// <summary>Walks the B+Tree leaf chain, so rows come out ordered by key.</summary>
+    private IEnumerable<DataChunk> IndexRangeChunks(Table indexed, long low, long high, Transaction txn)
+    {
+        var chunk = new DataChunk(indexed.Def.Columns.Count);
+        chunk.Reset();
+
+        foreach ((long key, long tupleId) in indexed.PrimaryKeyIndex.Range(low, high))
+        {
+            RowVersion? version = null;
+
+            if (indexed.Rows.TryGetValue(tupleId, out RowVersion? candidate) && _store.IsVisible(candidate, txn))
+                version = candidate;
+            else
+                version = VisibleVersion(indexed.Def, tupleId, txn);
+
+            if (version is null) continue;
+
+            // The entry may be stale: the row it points at can have been re-keyed.
+            if (version.Values[indexed.PrimaryKeyColumn] is not long current || current != key) continue;
+
+            chunk.Append(tupleId, version.Values, indexed.PrimaryKeyColumn);
+            if (!chunk.IsFull) continue;
+
+            chunk.Selection.SelectAll(chunk.Count);
+            yield return chunk;
+            chunk.Reset();
+        }
+
+        if (chunk.Count == 0) yield break;
+
+        chunk.Selection.SelectAll(chunk.Count);
+        yield return chunk;
+    }
+
+    private IEnumerable<DataChunk> VectorChunks(TableDef def, int column, CompareOp op, long threshold, Transaction txn)
+    {
+        var chunk = new DataChunk(def.Columns.Count);
+        chunk.Reset();
+
+        foreach (RowVersion version in _store.Scan(def.Name, txn))
+        {
+            chunk.Append(version.RowId, version.Values, column);
+            if (!chunk.IsFull) continue;
+
+            VectorFilter.Apply(chunk, op, threshold);
+            yield return chunk;
+            chunk.Reset();
+        }
+
+        if (chunk.Count == 0) yield break;
+
+        VectorFilter.Apply(chunk, op, threshold);
+        yield return chunk;
+    }
+
+    private IEnumerable<DataChunk> ScalarChunks(TableDef def, Expr? where, Transaction txn)
+    {
+        var chunk = new DataChunk(def.Columns.Count);
+        chunk.Reset();
+
+        foreach (RowVersion version in _store.Scan(def.Name, txn))
+        {
+            chunk.Append(version.RowId, version.Values, -1);
+            if (!chunk.IsFull) continue;
+
+            SelectScalar(chunk, def, where);
+            yield return chunk;
+            chunk.Reset();
+        }
+
+        if (chunk.Count == 0) yield break;
+
+        SelectScalar(chunk, def, where);
+        yield return chunk;
+    }
+
+    private static void SelectScalar(DataChunk chunk, TableDef def, Expr? where)
+    {
+        chunk.Selection.Clear();
+
+        if (where is null)
+        {
+            chunk.Selection.SelectAll(chunk.Count);
+            return;
+        }
+
+        for (int i = 0; i < chunk.Count; i++)
+            if (Evaluator.Truthy(Evaluator.Eval(where, def, chunk.Rows[i])))
+                chunk.Selection.Add(i);
+    }
+
+    /// <summary>Fallback for rows whose newest version is invisible to this snapshot.</summary>
+    private RowVersion? VisibleVersion(TableDef def, long rowId, Transaction txn)
+    {
+        List<RowVersion> versions = _store.GetTable(def.Name).Versions;
+
+        for (int i = versions.Count - 1; i >= 0; i--)
+        {
+            RowVersion version = versions[i];
+            if (version.RowId == rowId && _store.IsVisible(version, txn)) return version;
+        }
+
+        return null;
+    }
+
+    // ---------------------------------------------------------------- shared
 
     private static object? Coerce(Column column, object? value)
     {

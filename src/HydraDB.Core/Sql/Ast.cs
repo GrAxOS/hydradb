@@ -1,4 +1,5 @@
 using HydraDB.Core.Catalog;
+using HydraDB.Core.Exec;
 
 namespace HydraDB.Core.Sql;
 
@@ -29,6 +30,12 @@ public sealed class SelectStmt : Stmt
 {
     /// <summary>A single "*" entry means every column.</summary>
     public List<string> Columns = new();
+
+    /// <summary>Aggregates in select-list order. Non-empty means this is an aggregate query.</summary>
+    public List<AggregateSpec> Aggregates = new();
+
+    /// <summary>Single grouping column, or null for one global group.</summary>
+    public string? GroupBy;
 
     public string Table = string.Empty;
     public Expr? Where;

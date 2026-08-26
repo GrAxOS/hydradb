@@ -1,6 +1,7 @@
 using HydraDB.Core;
 using HydraDB.Core.Exec;
 using HydraDB.Core.Graph;
+using HydraDB.Core.Index;
 
 string directory = args.Length > 0
     ? args[0]
@@ -43,12 +44,24 @@ while (true)
             }
 
             case ".stats":
+            {
                 Console.WriteLine(
                     $"tables={engine.Store.Tables.Count} " +
                     $"commits={engine.Commits} " +
                     $"commitSeq={engine.Store.CommitSeq} " +
-                    $"wal={engine.WalBytes}B");
+                    $"wal={engine.WalBytes}B " +
+                    $"lastPlan={engine.LastPlan}");
+
+                foreach (var entry in engine.GetAllStats().OrderBy(e => e.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    IndexStats s = entry.Value;
+                    Console.WriteLine(
+                        $"  {s.Table}: order={s.Order} height={s.Height} keys={s.KeyCount} " +
+                        $"pages={s.PageCount} fill={s.FillFactor:F1}% log={s.LogBytes}B " +
+                        $"crc={(s.CrcOk ? "ok" : "BAD")} secondary={s.SecondaryCount}");
+                }
                 break;
+            }
 
             case ".checkpoint":
                 engine.Checkpoint();

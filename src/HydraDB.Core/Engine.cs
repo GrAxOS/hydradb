@@ -54,6 +54,12 @@ public sealed class Engine : IDisposable
 
     public long WalBytes => _wal.SizeBytes;
 
+    /// <summary>Access path used by the most recent scan. Diagnostic only.</summary>
+    public ScanPlan LastPlan => _executor.LastPlan;
+
+    /// <summary>Shape of every registered primary index. Runs a full validation per index.</summary>
+    public Dictionary<string, IndexStats> GetAllStats() => _indexes.GetAllStats();
+
     public Transaction Begin() => _store.BeginTxn();
 
     public QueryResult Execute(string sql, Transaction? txn = null)
