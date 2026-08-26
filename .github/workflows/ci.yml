@@ -2,9 +2,6 @@ name: ci
 
 on:
   push:
-    branches:
-      - main
-      - 'feat/**'
   pull_request:
   workflow_dispatch:
 
@@ -12,24 +9,39 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Clone repository at this commit
+        run: |
+          set -e
+          git clone --no-checkout "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          git fetch origin "${{ github.sha }}"
+          git checkout --detach "${{ github.sha }}"
+          git log --oneline -1
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
+      - name: Show SDK
+        working-directory: repo
+        run: dotnet --info
 
-      - run: dotnet --info
+      - name: Restore
+        working-directory: repo
+        run: dotnet restore HydraDB.sln
 
-      - run: dotnet restore HydraDB.sln
+      - name: Build
+        working-directory: repo
+        run: dotnet build HydraDB.sln -c Release --no-restore
 
-      - run: dotnet build HydraDB.sln -c Release --no-restore
+      - name: Test
+        working-directory: repo
+        run: dotnet test HydraDB.sln -c Release --no-build --logger "console;verbosity=normal"
 
-      - run: dotnet test HydraDB.sln -c Release --no-build --logger "console;verbosity=normal"
-
-      - name: cli smoke
+      - name: CLI smoke
+        working-directory: repo
         run: |
           printf 'create table t (id int primary key, v int)\ninsert into t values (1,10), (2,20), (3,30)\nselect count(*), sum(v) from t\n.checkpoint\n.stats\n' | dotnet run -c Release --project src/HydraDB.Cli -- ./ci-data
