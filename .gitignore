@@ -2,3 +2,8 @@ bin/
 obj/
 hydradata/
 *.user
+*.log
+TestResults/
+.vs/
+.idea/
+*.trx
