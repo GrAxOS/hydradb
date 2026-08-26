@@ -165,13 +165,17 @@ public sealed class BPlusTree : IDisposable
         else LoadMeta();
     }
 
-    /// <summary>m = (pageSize - header - 16) / (keySize + 8). 8 KiB pages give m = 508.</summary>
+    /// <summary>m = (pageSize - HeaderSize - 16) / (KeySize + ChildSize): 252 at 4096, 508 at 8192.</summary>
     public static int OrderFor(int pageSize) => (pageSize - HeaderSize - 16) / (KeySize + ChildSize);
 
     public int Order => _order;
     public int Height => _height;
     public long KeyCount => _keyCount;
     public int RootPageId => _rootPageId;
+
+    /// <summary>Pages allocated in the index file, including the meta page.</summary>
+    public int PageCount => _pageCount;
+
     public long LogBytes => _log.SizeBytes;
 
     /// <summary>Test hook: append page images and fsync, but skip the GroupEnd marker and the page writes.</summary>

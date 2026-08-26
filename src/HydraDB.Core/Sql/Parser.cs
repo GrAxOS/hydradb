@@ -1,4 +1,5 @@
 using HydraDB.Core.Catalog;
+using HydraDB.Core.Exec;
 
 namespace HydraDB.Core.Sql;
 
@@ -14,6 +15,8 @@ public sealed class Parser
     public Parser(string sql) => _tokens = new Lexer(sql).Tokenize();
 
     private Token Peek => _tokens[_position];
+
+    private Token PeekAt(int offset) => _tokens[Math.Min(_position + offset, _tokens.Count - 1)];
 
     private Token Next() => _tokens[_position++];
 
@@ -169,6 +172,7 @@ public sealed class Parser
         {
             do
             {
+                if (TryParseAggregate(statement)) continue;
                 statement.Columns.Add(Identifier());
             } while (Accept(","));
         }
@@ -177,6 +181,12 @@ public sealed class Parser
         statement.Table = Identifier();
 
         if (Accept("where")) statement.Where = ParseExpr();
+
+        if (Accept("group"))
+        {
+            Expect("by");
+            statement.GroupBy = Identifier();
+        }
 
         if (Accept("order"))
         {
@@ -189,6 +199,32 @@ public sealed class Parser
         if (Accept("limit")) statement.Limit = (int)Number();
 
         return statement;
+    }
+
+    /// <summary>COUNT(*), COUNT(col), SUM(col), AVG(col). Anything else is a plain column.</summary>
+    private bool TryParseAggregate(SelectStmt statement)
+    {
+        AggregateKind kind;
+        if (Peek.Is("count")) kind = AggregateKind.Count;
+        else if (Peek.Is("sum")) kind = AggregateKind.Sum;
+        else if (Peek.Is("avg")) kind = AggregateKind.Avg;
+        else return false;
+
+        if (!PeekAt(1).Is("(")) return false;
+
+        _position += 2;
+
+        if (kind == AggregateKind.Count && Accept("*"))
+        {
+            Expect(")");
+            statement.Aggregates.Add(new AggregateSpec(AggregateKind.CountStar, null));
+            return true;
+        }
+
+        string column = Identifier();
+        Expect(")");
+        statement.Aggregates.Add(new AggregateSpec(kind, column));
+        return true;
     }
 
     private Stmt ParseUpdate()
@@ -246,6 +282,16 @@ public sealed class Parser
     private Expr ParseComparison()
     {
         Expr left = ParsePrimary();
+
+        // BETWEEN lowers to and(>=, <=) so the range planner sees two ordinary bounds.
+        if (Peek.Kind != TokenKind.Punct && Peek.Is("between"))
+        {
+            _position++;
+            Expr lower = ParsePrimary();
+            Expect("and");
+            Expr upper = ParsePrimary();
+            return new Binary("and", new Binary(">=", left, lower), new Binary("<=", left, upper));
+        }
 
         while (Peek.Kind == TokenKind.Punct &&
                Peek.Text is "=" or "<" or ">" or "<=" or ">=" or "<>")

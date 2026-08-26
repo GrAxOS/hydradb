@@ -19,35 +19,49 @@ public sealed class BPlusTreeTests
     {
         Assert.Equal(508, BPlusTree.OrderFor(8192));
         Assert.Equal(252, BPlusTree.OrderFor(4096));
-        Assert.Equal(BPlusTree.OrderFor(Pager.PageSize), new BPlusTree(NewPaths().PagePath, NewPaths().LogPath).Order);
+
+        (string pagePath, string logPath) = NewPaths();
+        using var tree = new BPlusTree(pagePath, logPath);
+
+        Assert.Equal(BPlusTree.OrderFor(Pager.PageSize), tree.Order);
     }
 
     [Fact]
-    public void TenThousandRandomKeysAreAllFound()
+    public void TenThousandSequentialKeysAreAllFound()
     {
         (string pagePath, string logPath) = NewPaths();
-        var random = new Random(20260826);
-        var keys = new HashSet<long>();
-        while (keys.Count < 10_000) keys.Add(random.NextInt64(long.MinValue, long.MaxValue));
-
         using var tree = new BPlusTree(pagePath, logPath);
 
-        long tupleId = 1;
-        foreach (long key in keys) tree.Insert(key, tupleId++);
+        for (long key = 1; key <= 10_000; key++) tree.Insert(key, key * 2);
 
         tree.Validate();
-        Assert.Equal(10_000, tree.KeyCount);
+        Assert.Equal(10_000L, tree.KeyCount);
         Assert.True(tree.Height > 1, "10k keys must not fit in a single leaf");
 
-        tupleId = 1;
-        foreach (long key in keys)
-        {
-            long? found = tree.Search(key);
-            Assert.NotNull(found);
-            Assert.Equal(tupleId++, found!.Value);
-        }
+        for (long key = 1; key <= 10_000; key++) Assert.Equal(key * 2, tree.Search(key));
 
-        Assert.Null(tree.Search(keys.Max() == long.MaxValue ? long.MinValue + 1 : keys.Max() + 1));
+        Assert.Null(tree.Search(0));
+        Assert.Null(tree.Search(10_001));
+        Assert.Equal(101, tree.Range(500, 600).Count());
+    }
+
+    [Fact]
+    public void TenThousandReverseKeysAreAllFound()
+    {
+        (string pagePath, string logPath) = NewPaths();
+        using var tree = new BPlusTree(pagePath, logPath);
+
+        for (long key = 10_000; key >= 1; key--) tree.Insert(key, key * 2);
+
+        tree.Validate();
+        Assert.Equal(10_000L, tree.KeyCount);
+        Assert.True(tree.Height > 1, "10k keys must not fit in a single leaf");
+
+        for (long key = 10_000; key >= 1; key--) Assert.Equal(key * 2, tree.Search(key));
+
+        Assert.Null(tree.Search(0));
+        Assert.Null(tree.Search(10_001));
+        Assert.Equal(101, tree.Range(500, 600).Count());
     }
 
     [Fact]
