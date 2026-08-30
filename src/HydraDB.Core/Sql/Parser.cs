@@ -20,6 +20,9 @@ public sealed class Parser
 
     private Token Next() => _tokens[_position++];
 
+    private static bool IsIdentifierToken(Token token) =>
+        token.Kind is TokenKind.Ident or TokenKind.Keyword;
+
     private bool Accept(string text)
     {
         if (!Peek.Is(text)) return false;
@@ -36,7 +39,7 @@ public sealed class Parser
     private string Identifier()
     {
         Token token = Next();
-        if (token.Kind != TokenKind.Ident && token.Kind != TokenKind.Keyword)
+        if (!IsIdentifierToken(token))
             throw new SqlException($"expected identifier but found '{token.Text}'");
         return token.Text;
     }
@@ -345,15 +348,10 @@ public sealed class Parser
             return new Literal(null);
         }
 
-        // Identifier() accepts keyword tokens in schema/projection contexts. The
-        // same stored column must remain addressable in predicates and assignment
-        // expressions; otherwise CREATE TABLE ... (order INT) succeeds but
-        // WHERE order = 1 fails to parse. Literal keywords are handled above.
-        if (token.Kind == TokenKind.Ident || token.Kind == TokenKind.Keyword)
-        {
-            _position++;
-            return new ColumnRef(token.Text);
-        }
+        // Schema, projection, assignment, and expression contexts must use one
+        // identifier-token rule. Literal keywords are consumed above first.
+        if (IsIdentifierToken(token))
+            return new ColumnRef(Identifier());
 
         throw new SqlException($"unexpected token '{token.Text}' in expression");
     }
