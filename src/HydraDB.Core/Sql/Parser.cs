@@ -345,7 +345,11 @@ public sealed class Parser
             return new Literal(null);
         }
 
-        if (token.Kind == TokenKind.Ident)
+        // Identifier() accepts keyword tokens in schema/projection contexts. The
+        // same stored column must remain addressable in predicates and assignment
+        // expressions; otherwise CREATE TABLE ... (order INT) succeeds but
+        // WHERE order = 1 fails to parse. Literal keywords are handled above.
+        if (token.Kind == TokenKind.Ident || token.Kind == TokenKind.Keyword)
         {
             _position++;
             return new ColumnRef(token.Text);
