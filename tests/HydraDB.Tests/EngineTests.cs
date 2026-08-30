@@ -32,6 +32,26 @@ public sealed class EngineTests
     }
 
     [Fact]
+    public void KeywordNamedColumnsWorkInPredicates()
+    {
+        using var engine = new Engine(NewDirectory());
+        engine.Execute("create table queue (order int primary key, label text)");
+        engine.Execute("insert into queue values (1, 'first'), (2, 'second')");
+
+        var selected = engine.Execute("select order, label from queue where order = 2");
+
+        Assert.Single(selected.Rows);
+        Assert.Equal(2L, selected.Rows[0][0]);
+        Assert.Equal("second", selected.Rows[0][1]);
+
+        engine.Execute("update queue set label = 'done' where order = 2");
+        Assert.Equal("done", engine.Execute("select label from queue where order = 2").Rows[0][0]);
+
+        engine.Execute("delete from queue where order = 1");
+        Assert.Single(engine.Execute("select order from queue").Rows);
+    }
+
+    [Fact]
     public void SurvivesReopenThroughWalReplay()
     {
         string directory = NewDirectory();
